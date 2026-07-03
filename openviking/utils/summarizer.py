@@ -125,6 +125,7 @@ class Summarizer:
                     lock_handoff=lock_handoff,
                     is_code_repo=kwargs.get("is_code_repo", False),
                     target_preexisting=resolve_target_preexisting(idx, target_uri),
+                    saa_provider_context=ctx.saa_provider_context,
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

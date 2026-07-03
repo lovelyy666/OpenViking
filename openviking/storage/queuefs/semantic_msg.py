@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from openviking.server.provider_context import ProviderRequestContext
 from openviking.storage.transaction import LockHandoffRef
 
 
@@ -55,6 +56,7 @@ class SemanticMsg:
     lock_handoff: Optional[LockHandoffRef] = None
     is_code_repo: bool = False
     target_preexisting: Optional[bool] = None
+    saa_provider_context: Optional[Dict[str, Any]] = None
     coalesce_key: str = ""
     coalesce_version: int = 0
     changes: Optional[Dict[str, List[str]]] = (
@@ -76,6 +78,7 @@ class SemanticMsg:
         lock_handoff: Optional[LockHandoffRef] = None,
         is_code_repo: bool = False,
         target_preexisting: Optional[bool] = None,
+        saa_provider_context: Optional[Dict[str, Any] | ProviderRequestContext] = None,
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
@@ -94,6 +97,12 @@ class SemanticMsg:
         self.lock_handoff = lock_handoff
         self.is_code_repo = is_code_repo
         self.target_preexisting = target_preexisting
+        if isinstance(saa_provider_context, ProviderRequestContext):
+            self.saa_provider_context = saa_provider_context.to_dict()
+        elif isinstance(saa_provider_context, dict):
+            self.saa_provider_context = dict(saa_provider_context)
+        else:
+            self.saa_provider_context = None
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
@@ -137,6 +146,9 @@ class SemanticMsg:
             lock_handoff=LockHandoffRef.from_value(data.get("lock_handoff")),
             is_code_repo=data.get("is_code_repo", False),
             target_preexisting=data.get("target_preexisting"),
+            saa_provider_context=data.get("saa_provider_context")
+            if isinstance(data.get("saa_provider_context"), dict)
+            else None,
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

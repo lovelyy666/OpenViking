@@ -582,6 +582,7 @@ class ReindexExecutor:
             peer_id=ctx.user.user_id,
             role=str(ctx.role),
             skip_vectorization=True,
+            saa_provider_context=ctx.saa_provider_context,
         )
         await processor.on_dequeue({"data": msg.to_json()}, lock=lock.as_borrowed())
 
