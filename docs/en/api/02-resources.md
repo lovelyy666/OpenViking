@@ -49,6 +49,14 @@ OpenViking supports various resource types, categorized by functionality:
 |------|-------------|
 | Feishu/Lark | URL-based, supports docx, wiki, sheets, bitable. By default uses app credentials from FEISHU_APP_ID and FEISHU_APP_SECRET; user-token imports can pass `args.feishu_access_token`, and user-token watches also pass `args.feishu_refresh_token` |
 
+**Web Pages (recursive web crawler)**
+
+| Type | Resource Name | Description |
+|------|---------------|-------------|
+| Single page / recursive crawl | `https://host/path` | By default only the entry page is fetched. Set `args.depth > 0` to crawl same-host links breadth-first; `args.max_pages` only bounds how many pages are collected. Each page is extracted to Markdown with trafilatura. Supported `args`: `depth`, `max_pages`, `include_paths`, `exclude_paths`, `allow_external_links`, `skip_download_links`. Download links discovered on pages are skipped by default (`skip_download_links=true`) to avoid importing sidecar files such as `llms.txt`; set it to `false` to download same-host file links and count them toward `max_pages`. `include_paths`/`exclude_paths` use **path-prefix** matching (e.g. `/docs/` matches only paths starting with `/docs/`, never substrings like `/blog/docs-tips`). |
+
+> Routing: sitemap-looking URLs (`https://host/sitemap.xml`, `https://host/feed.xml`, `*.atom`, ...) and explicit `args.site=true` are delegated to the whole-website ingestion below; Git hosting URLs such as `https://github.com/{org}/{repo}` are delegated to the Code section above.
+
 **Whole Website (sitemap / RSS / Atom)**
 
 | Type | Resource Name | Description |
@@ -103,7 +111,8 @@ Source Input -> Parse -> Resource Tree Build -> Persistence -> Semantic Processi
 Resource incremental updates are implemented via the **Watch Task** mechanism:
 
 #### Watch Task Creation
-- Set `watch_interval > 0` (in minutes) when calling `add_resource` to create a watch task
+- Set `watch_interval > 0` (in minutes) when calling `add_resource` with a re-readable source, such as a URL, sitemap, or RSS feed, to create a watch task
+- Uploaded content referenced by `temp_file_id` is consumed as a one-time snapshot and cannot be watched; re-add it when the local source changes
 - You may specify `to` to define the target URI; if omitted, the task binds to the `root_uri` returned by this import
 - Pointing a watch at a sitemap/RSS/Atom URL keeps the **whole site** in sync: each refresh re-reads the feed and rebuilds the tree, so newly published pages are added and removed pages drop automatically
 - `WatchManager` handles task persistence
@@ -125,7 +134,7 @@ Resource incremental updates are implemented via the **Watch Task** mechanism:
 
 ### add_resource
 
-Add a resource to the knowledge base. The SDK supports local files/directories, URLs, and other sources. Raw HTTP calls accept remote URLs through `path` or uploaded local files through `temp_file_id`.
+Add a resource to the knowledge base. The SDK supports local files/directories, URLs, and other sources. Raw HTTP calls accept remote URLs through `path` or uploaded local files through `temp_file_id`. Uploaded content is a one-time snapshot, so it cannot be combined with `watch_interval > 0`.
 
 #### 1. API Implementation Overview
 
@@ -168,8 +177,8 @@ This endpoint is the core entry point for resource management, supporting adding
 | exclude | string | No | None | File patterns to exclude (glob) |
 | directly_upload_media | bool | No | True | Whether to directly upload media files |
 | preserve_structure | bool | No | None | Whether to preserve directory structure |
-| args | object | No | `{}` | Parser-specific import options forwarded to the source parser/accessor. E.g. `args.site=true/false` forces/opts out of whole-site (sitemap/RSS) ingestion, `args.max_pages` etc. override the `webfeed` config, and Feishu user-token imports pass `args.feishu_access_token`. Core `add_resource` fields such as `path`, `to`, `watch_interval`, `include`, and `exclude` are not allowed inside `args` |
-| watch_interval | float | No | 0 | Scheduled update interval (minutes). >0 creates task; <=0 cancels task; explicit `to` wins, otherwise binds to the imported `root_uri` |
+| args | object | No | `{}` | Parser-specific import options forwarded to the source parser/accessor. E.g. `args.site=true/false` forces/opts out of whole-site (sitemap/RSS) ingestion, `args.max_pages` etc. override the `webfeed` config; the recursive web crawler accepts `args.depth`, `args.max_pages`, `args.include_paths`, `args.exclude_paths`, `args.allow_external_links`, `args.skip_download_links`; Feishu user-token imports pass `args.feishu_access_token`. Core `add_resource` fields such as `path`, `to`, `watch_interval`, `include`, and `exclude` are not allowed inside `args` |
+| watch_interval | float | No | 0 | Scheduled update interval (minutes). >0 creates a task for a re-readable URL/sitemap/RSS source; uploaded `temp_file_id` content is a one-time snapshot and must be re-added when it changes. <=0 cancels a task; explicit `to` wins, otherwise binds to the imported `root_uri` |
 | telemetry | TelemetryRequest | No | False | Whether to return telemetry data |
 
 **Additional Notes**:
@@ -211,6 +220,18 @@ curl -X POST http://localhost:1933/api/v1/resources \
     "path": "https://example.com/guide.md",
     "reason": "User guide documentation",
     "wait": true
+  }'
+
+# Recursively crawl a site: expand along same-host links; depth bounds
+# how many levels, max_pages bounds how many pages are collected
+curl -X POST http://localhost:1933/api/v1/resources \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{
+    "path": "https://docs.openviking.ai/getting-started/01-introduction",
+    "wait": true,
+    "timeout": 60,
+    "args": { "depth": 1, "max_pages": 10 }
   }'
 
 # Add from local file (requires temp_upload first)
@@ -293,6 +314,26 @@ result = client.add_resource(
     reason="External API documentation"
 )
 
+# Recursively crawl a site (same-host BFS; depth levels, max_pages cap)
+result = client.add_resource(
+    "https://docs.openviking.ai/getting-started/01-introduction",
+    wait=True,
+    timeout=180,
+    args={"depth": 1, "max_pages": 10},
+)
+
+# Recursive crawl with path-prefix filters, also downloading file links
+result = client.add_resource(
+    "https://docs.openviking.ai/",
+    args={
+        "depth": 2,
+        "max_pages": 50,
+        "include_paths": ["/docs/"],
+        "exclude_paths": ["/changelog"],
+        "skip_download_links": False,
+    },
+)
+
 # Add to the current user's private resource root
 result = client.add_resource(
     "./documents/guide.md",
@@ -328,6 +369,16 @@ client.add_resource(
 )
 ```
 
+**TypeScript SDK**
+
+```typescript
+const task = await client.addResource("https://example.com/docs", {
+  to: "viking://resources/docs/",
+  wait: true,
+});
+console.log(task);
+```
+
 **Go SDK**
 
 ```go
@@ -349,6 +400,18 @@ ov add-resource ./documents/guide.md --reason "User guide"
 
 # Add from URL
 ov add-resource https://example.com/guide.md --to viking://resources/guide.md
+
+# Recursively crawl a site: only the entry page is fetched unless depth>0
+ov add-resource "https://docs.openviking.ai/getting-started/01-introduction" \
+  --args="depth:1,max_pages:10"
+
+# Recursive crawl with path-prefix filters (only /docs/, exclude changelog)
+ov add-resource "https://docs.openviking.ai/" \
+  --args='{"depth":2,"max_pages":50,"include_paths":["/docs/"],"exclude_paths":["/changelog"]}'
+
+# Download links on pages are skipped by default; opt in to fetch PDF/TXT/MD etc.
+ov add-resource "https://example.com/docs" \
+  --args="depth:1,max_pages:20,skip_download_links:false"
 
 # Wait for processing to complete
 ov add-resource ./documents/guide.md --wait
@@ -688,6 +751,13 @@ result = client.add_skill("./skills/my-skill.json")
 
 # Wait for processing to complete
 client.wait_processed()
+```
+
+**TypeScript SDK**
+
+```typescript
+const task = await client.addSkill("./my-skill", { wait: true });
+console.log(task);
 ```
 
 **Go SDK**

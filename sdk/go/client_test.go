@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -165,6 +166,97 @@ func TestFindOmitsSearchFiltersWhenUnset(t *testing.T) {
 	}
 }
 
+func TestListSendsOrderingOptions(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fs/ls" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("node_limit"); got != "200" {
+			t.Fatalf("node_limit = %q", got)
+		}
+		if got := r.URL.Query().Get("sort_by"); got != "mtime" {
+			t.Fatalf("sort_by = %q", got)
+		}
+		if got := r.URL.Query().Get("sort_order"); got != "desc" {
+			t.Fatalf("sort_order = %q", got)
+		}
+		writeOK(t, w, []any{})
+	}))
+	defer closeServer()
+
+	_, err := client.List(context.Background(), "viking://session", &ListOptions{
+		NodeLimit: 200,
+		SortBy:    "mtime",
+		SortOrder: "desc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindSendsImageQuery(t *testing.T) {
+	imagePath := filepath.Join(t.TempDir(), "query.png")
+	if err := os.WriteFile(imagePath, []byte("\x89PNG\r\n\x1a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/search/find" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body := readJSONBody(t, r)
+		if got := body["query"]; got != "" {
+			t.Fatalf("query = %#v", got)
+		}
+		imageURL, ok := body["image_url"].(string)
+		if !ok || !strings.HasPrefix(imageURL, "data:image/png;base64,") {
+			t.Fatalf("image_url = %#v", body["image_url"])
+		}
+		writeOK(t, w, map[string]any{"resources": []any{}})
+	}))
+	defer closeServer()
+
+	if _, err := client.Find(context.Background(), "", &FindOptions{
+		TargetURI: "viking://resources/images",
+		Image:     imagePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReindexSendsDryRun(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/content/reindex" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s", r.Method)
+		}
+		body := readJSONBody(t, r)
+		if got := body["uri"]; got != "viking://resources/demo" {
+			t.Fatalf("uri = %#v", got)
+		}
+		if got := body["mode"]; got != "prune_orphans" {
+			t.Fatalf("mode = %#v", got)
+		}
+		if got := body["wait"]; got != false {
+			t.Fatalf("wait = %#v", got)
+		}
+		if got := body["dry_run"]; got != true {
+			t.Fatalf("dry_run = %#v", got)
+		}
+		writeOK(t, w, map[string]any{"status": "completed"})
+	}))
+	defer closeServer()
+
+	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
+		Mode:   "prune_orphans",
+		Wait:   false,
+		DryRun: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdminCreatePathsAcceptInitialUserConfig(t *testing.T) {
 	var seen []map[string]any
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -198,6 +290,88 @@ func TestAdminCreatePathsAcceptInitialUserConfig(t *testing.T) {
 	}
 	if got := seen[1]["user_config"].(map[string]any)["add_targets"].(map[string]any)["resource_uri"]; got != "viking://user/resources/project-a" {
 		t.Fatalf("user_config resource_uri = %#v", got)
+	}
+}
+
+func TestAdminSeedPayloads(t *testing.T) {
+	var seen []map[string]any
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/admin/accounts",
+			"/api/v1/admin/accounts/acct/users",
+			"/api/v1/admin/accounts/acct/users/alice/key":
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s", r.Method)
+		}
+		body := readJSONBody(t, r)
+		seen = append(seen, body)
+		writeOK(t, w, body)
+	}))
+	defer closeServer()
+
+	adminSeed := "admin-seed"
+	if _, err := client.AdminCreateAccountWithOptions(context.Background(), "acct", "admin", &AdminCreateAccountOptions{
+		Seed: &adminSeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceSeed := "alice-seed"
+	if _, err := client.AdminRegisterUserWithOptions(context.Background(), "acct", "alice", "admin", &AdminRegisterUserOptions{
+		Seed: &aliceSeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newSeed := "new-seed"
+	if _, err := client.AdminRegenerateKeyWithOptions(context.Background(), "acct", "alice", &AdminRegenerateKeyOptions{
+		Seed: &newSeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := seen[0]["seed"]; got != "admin-seed" {
+		t.Fatalf("create seed = %#v", got)
+	}
+	if got := seen[1]["seed"]; got != "alice-seed" {
+		t.Fatalf("register seed = %#v", got)
+	}
+	if got := seen[2]["seed"]; got != "new-seed" {
+		t.Fatalf("regenerate seed = %#v", got)
+	}
+}
+
+func TestAdminEmptySeedPayloadsAreSent(t *testing.T) {
+	var seen []map[string]any
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readJSONBody(t, r)
+		seen = append(seen, body)
+		writeOK(t, w, body)
+	}))
+	defer closeServer()
+
+	emptySeed := ""
+	if _, err := client.AdminCreateAccountWithOptions(context.Background(), "acct", "admin", &AdminCreateAccountOptions{
+		Seed: &emptySeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.AdminRegisterUserWithOptions(context.Background(), "acct", "alice", "admin", &AdminRegisterUserOptions{
+		Seed: &emptySeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.AdminRegenerateKeyWithOptions(context.Background(), "acct", "alice", &AdminRegenerateKeyOptions{
+		Seed: &emptySeed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, body := range seen {
+		if got, ok := body["seed"]; !ok || got != "" {
+			t.Fatalf("request %d seed = %#v, present = %v", i, got, ok)
+		}
 	}
 }
 
@@ -261,6 +435,27 @@ func TestSearchOmitsSearchFiltersWhenUnset(t *testing.T) {
 	defer closeServer()
 
 	if _, err := client.Search(context.Background(), "auth", &SearchOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSearchSendsImageURI(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/search/search" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		body := readJSONBody(t, r)
+		if got := body["image_url"]; got != "viking://resources/images/cat.png" {
+			t.Fatalf("image_url = %#v", got)
+		}
+		writeOK(t, w, map[string]any{"resources": []any{}})
+	}))
+	defer closeServer()
+
+	if _, err := client.Search(context.Background(), "similar poster", &SearchOptions{
+		TargetURI: "viking://resources/images",
+		Image:     "viking://resources/images/cat.png",
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -330,6 +525,10 @@ func TestAddResourceUploadsLocalFile(t *testing.T) {
 			if body["directly_upload_media"] != true {
 				t.Fatalf("directly_upload_media = %#v", body["directly_upload_media"])
 			}
+			// args must be omitted when the caller does not pass any, so the
+			// request is accepted by pre-#2549 instances whose resources route
+			// uses model_config=ConfigDict(extra="forbid").
+			requireBodyKeysAbsent(t, body, "args")
 			writeOK(t, w, map[string]any{"uri": "viking://resources/note.md"})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -343,6 +542,78 @@ func TestAddResourceUploadsLocalFile(t *testing.T) {
 	}
 	if result["uri"] != "viking://resources/note.md" {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestAddResourceSendsArgsWhenProvided(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/resources/temp_upload":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Fatal(err)
+			}
+			writeOK(t, w, map[string]any{"temp_file_id": "tmp-file"})
+		case "/api/v1/resources":
+			body := readJSONBody(t, r)
+			args, ok := body["args"].(map[string]any)
+			if !ok {
+				t.Fatalf("args = %#v, want map", body["args"])
+			}
+			if args["key"] != "value" {
+				t.Fatalf("args[key] = %#v", args["key"])
+			}
+			writeOK(t, w, map[string]any{"uri": "viking://resources/note.md"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer closeServer()
+
+	if _, err := client.AddResource(context.Background(), filePath, &AddResourceOptions{
+		Args: map[string]any{"key": "value"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An explicitly-provided but empty Args map is treated the same as no args: the
+// key is omitted so the request stays compatible with pre-#2549 instances. The
+// resources create route defaults args to {} server-side, so "absent" and
+// "present-but-empty" are equivalent here. Mirrors the Python SDK #2834.
+func TestAddResourceOmitsExplicitlyEmptyArgs(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "note.md")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/resources/temp_upload":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				t.Fatal(err)
+			}
+			writeOK(t, w, map[string]any{"temp_file_id": "tmp-file"})
+		case "/api/v1/resources":
+			body := readJSONBody(t, r)
+			requireBodyKeysAbsent(t, body, "args")
+			writeOK(t, w, map[string]any{"uri": "viking://resources/note.md"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer closeServer()
+
+	if _, err := client.AddResource(context.Background(), filePath, &AddResourceOptions{
+		Args: map[string]any{},
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -734,7 +1005,12 @@ func TestExportOVPackWritesFile(t *testing.T) {
 	}))
 	defer closeServer()
 
-	outPath, err := client.ExportOVPack(context.Background(), "resources/docs", t.TempDir(), nil)
+	directory := t.TempDir()
+	existingPath := filepath.Join(directory, "docs.ovpack")
+	if err := os.WriteFile(existingPath, []byte("old-backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outPath, err := client.ExportOVPack(context.Background(), "resources/docs", directory, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,6 +1020,49 @@ func TestExportOVPackWritesFile(t *testing.T) {
 	}
 	if string(content) != "OVPACK" {
 		t.Fatalf("content = %q", string(content))
+	}
+	if matches, err := filepath.Glob(filepath.Join(directory, ".docs.ovpack-*.tmp")); err != nil || len(matches) != 0 {
+		t.Fatalf("temporary files = %v, err = %v", matches, err)
+	}
+}
+
+func TestBackupOVPackDoesNotPublishInterruptedDownload(t *testing.T) {
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "20")
+		if _, err := w.Write([]byte("partial")); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer closeServer()
+
+	for _, existingOutput := range []bool{true, false} {
+		t.Run(fmt.Sprintf("existing=%t", existingOutput), func(t *testing.T) {
+			directory := t.TempDir()
+			outPath := filepath.Join(directory, "backup.ovpack")
+			if existingOutput {
+				if err := os.WriteFile(outPath, []byte("known-good-backup"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := client.BackupOVPack(context.Background(), outPath, nil); err == nil {
+				t.Fatal("expected interrupted download to fail")
+			}
+			content, err := os.ReadFile(outPath)
+			if existingOutput {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(content) != "known-good-backup" {
+					t.Fatalf("content = %q", string(content))
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("expected no final file, err = %v", err)
+			}
+			if matches, err := filepath.Glob(filepath.Join(directory, ".backup.ovpack-*.tmp")); err != nil || len(matches) != 0 {
+				t.Fatalf("temporary files = %v, err = %v", matches, err)
+			}
+		})
 	}
 }
 

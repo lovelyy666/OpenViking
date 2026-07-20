@@ -69,7 +69,7 @@ openviking-server doctor
     "api_base" : "https://ark.cn-beijing.volces.com/api/v3",
     "api_key"  : "your-volcengine-api-key",
     "provider" : "volcengine",
-    "model"    : "doubao-seed-2-0-pro-260215"
+    "model"    : "doubao-seed-2-0-lite-260428"
   }
 }
 ```
@@ -255,7 +255,7 @@ openviking-server doctor
 | `doubao-embedding-vision-251215` | 1024 | multimodal | 推荐 |
 | `doubao-embedding-250615` | 1024 | text | 仅文本 |
 
-使用 `input: "multimodal"` 时，OpenViking 可以嵌入文本、图片（PNG、JPG 等）和混合内容。
+使用 `input: "multimodal"` 时，OpenViking 可以嵌入文本、图片（PNG、JPG 等）和混合内容。以图搜图需要该模式；纯文本 embedding 模型仍会索引图片 summary，但不能接收图片查询。
 
 **支持的 provider:**
 - `openai`: OpenAI Embedding API
@@ -492,6 +492,19 @@ openviking-server doctor
 }
 ```
 
+Sparse 输出是 embedding provider 的能力，不会因为设置
+`storage.vectordb.sparse_weight` 就自动出现。OpenViking 当前只为
+`volcengine` 和 `vikingdb` 实现了 `sparse` / `hybrid` embedding provider；
+OpenAI 兼容接口、Ollama 和内置 `local` provider 目前都只支持 dense。
+因此，自托管的 `/v1/embeddings` 不会被自动当成 sparse 接口，OpenViking
+也不会额外探测 `/v1/embeddings/sparse` 路由。
+
+当 provider 只返回 dense vector 时，OpenViking 不会自动补充 BM25 或其他
+sparse-vector 兜底。若要启用混合检索，需要配置受支持的 sparse/hybrid
+provider，并设置 `storage.vectordb.sparse_weight > 0`。自托管模型的内存需求
+取决于具体 provider 和模型，不由 OpenViking 控制；生产启用前请按模型文档
+评估资源占用。
+
 #### Hybrid Embedding
 
 支持两种方式：
@@ -540,7 +553,7 @@ openviking-server doctor
   "vlm": {
     "provider": "volcengine",
     "api_key": "your-api-key",
-    "model": "doubao-seed-2-0-pro-260215",
+    "model": "doubao-seed-2-0-lite-260428",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "max_retries": 3
   }
@@ -559,7 +572,7 @@ openviking-server doctor
 | `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`64`） |
 | `max_retries` | int | VLM provider 瞬时错误的最大重试次数（默认：`3`；`0` 表示禁用重试） |
 | `backup` | object | 可选的备用 VLM 配置（结构与 `vlm` 相同），当主 VLM 遇到限流、`5xx`、超时或连接失败等可重试错误时自动切换。仅支持 1 层备用 &mdash; 备用 VLM 本身不能再嵌套 `backup` |
-| `timeout` | float | 单次 VLM API 请求的 HTTP 超时时间（秒），传递给底层 OpenAI/LiteLLM 客户端。慢端点（如 DashScope、本地推理）可调大。必须 `> 0`（默认：`60.0`） |
+| `timeout` | float | 单次 VLM API 请求的 HTTP 超时时间（秒），传递给底层 OpenAI/LiteLLM 客户端。慢端点（如 DashScope、本地推理）可调大。必须 `> 0`（默认：`600.0`） |
 | `extra_headers` | object | 兼容 HTTP provider 的自定义请求头。`kimi` 默认已注入所需订阅请求头，也支持在这里覆盖或扩展 |
 | `extra_request_body` | object | 传给 OpenAI 兼容 completion 请求的额外 JSON body 字段，可用于 Ollama `{"think": false}` 等 provider 专有参数 |
 | `stream` | bool | 启用流式模式（OpenAI 兼容 provider 可用，默认：`false`） |
@@ -570,7 +583,7 @@ openviking-server doctor
 
 | 模型 | 说明 |
 |------|------|
-| `doubao-seed-2-0-pro-260215` | 推荐用于语义提取 |
+| `doubao-seed-2-0-lite-260428` | 推荐用于语义提取 |
 | `doubao-pro-32k` | 用于更长上下文 |
 
 添加资源时，VLM 生成：
@@ -716,7 +729,7 @@ ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
 | `max_rows_per_sheet` | int | 电子表格每个 sheet 最大导入行数（默认 `1000`） |
 | `max_records_per_table` | int | 多维表格每个表最大导入记录数（默认 `1000`） |
 
-**依赖**：`pip install 'openviking[bot-feishu]'`
+**依赖**：已默认包含在 `openviking[bot]` 安装中
 
 **Lark 国际版**：对于 Lark URL（`*.larksuite.com`），请将 `domain` 设为 `https://open.larksuite.com`。
 
@@ -806,6 +819,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
     "api_base": "https://dashscope.aliyuncs.com/compatible-api/v1/reranks",
     "model": "qwen3-vl-rerank",
     "timeout": 120,
+    "max_input_tokens": 2048,
     "threshold": 0.1
   }
 }
@@ -823,6 +837,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 | `api_base` | str | 接口地址（用于 `openai` 提供方） |
 | `model` | str | 模型名称（用于 `openai` 提供方） |
 | `timeout` | float | OpenAI 兼容 provider 的 HTTP 请求超时时间，单位为秒。对于较慢或冷启动的本地 rerank 服务可适当增大。默认：`30.0` |
+| `max_input_tokens` | int | 每个 query-document 对发送给 reranker 的最大估算原始文本 token 数；超长输入会保留开头和结尾。`0` 表示不截断。默认：`0` |
 | `threshold` | float | 分数阈值，范围为 `0.0` 到 `1.0`。低于此值的结果会被过滤。默认：`0.1` |
 | `extra_headers` | object | 自定义 HTTP 请求头（OpenAI 兼容 provider 可用，可选） |
 
@@ -871,7 +886,7 @@ Grep 引擎配置，用于内容模式搜索。这些设置为服务端配置，
 | `engine` | str | 搜索引擎模式：`"auto"` 在可用时使用 VikingDB BM25 召回，不可用时回退到本地文件系统搜索；`"fs"` 强制仅使用本地文件系统搜索。 | `"auto"` |
 | `switch_to_remote_threshold` | int | 切换到 VikingDB BM25 召回的 L2 记录数阈值。当搜索范围内的 L2 文件数达到此阈值时，使用 VikingDB BM25 进行第一阶段召回；否则使用本地文件系统搜索。设为 `0` 表示始终使用 VikingDB BM25。必须 ≥ 0。 | `10000` |
 
-对于 VikingDB / Volcengine FullText grep，OpenViking 会写入 `content` text 字段用于 BM25 召回。源上下文中保留完整内容，仅在最终写入向量库 adapter payload 时将该字段截断到 **1 MB**，以满足后端 payload 限制。
+对于 VikingDB / Volcengine FullText grep，OpenViking 会写入 `content` text 字段用于 BM25 召回。源上下文中保留完整内容，仅在最终写入向量库 adapter payload 时将该字段截断到 **1 MB**，以满足后端 payload 限制。只有 VikingDB 系后端使用 `content`；其它后端（`local`、`cuvs`、`qdrant`、`opengauss`、`http`）不写入该字段。
 
 ### storage
 
@@ -1181,7 +1196,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上 VikingDB）, 'vikingdb'（私有部署）, 'qdrant' 或 'opengauss' | "local" |
+| `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上 VikingDB）, 'vikingdb'（私有部署）, 'cuvs'（本地存储 + GPU dense search）, 'qdrant' 或 'opengauss' | "local" |
 | `name` | str | VectorDB 的集合名称 | "context" |
 | `url` | str | 'http' 类型的远程服务 URL（例如 'http://localhost:5000'） | null |
 | `project_name` | str | 项目名称（别名 project） | "default" |
@@ -1190,6 +1205,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | `sparse_weight` | float | 混合向量搜索的稀疏权重，仅在使用混合索引时生效 | 0.0 |
 | `volcengine` | object | 'volcengine' 类型的 VikingDB 配置 | - |
 | `vikingdb` | object | 'vikingdb' 类型的私有部署配置 | - |
+| `cuvs` | object | NVIDIA cuVS 配置，也用于在 'local' 下显式开启显存感知自动模式，参见 [cuVS 使用指南](./16-cuvs.md) | - |
 | `qdrant` | object | 'qdrant' 类型的 Qdrant 配置 | - |
 | `opengauss` | object | 'opengauss' 原生向量后端配置 | - |
 
@@ -1271,6 +1287,22 @@ OpenViking 使用两个配置文件：
 
 配置文件放在默认路径时，OpenViking 自动加载，无需额外设置。
 
+> **Root key 双文件规则：** `ov.conf` 中的 `server.root_api_key` 是服务端
+> 接受的凭据；`ovcli.conf` 中的 `root_api_key` 是 `ov --sudo` 使用的客户端
+> 副本。如果该 CLI 用于管理这个服务端，两处值必须一致，并在轮换时同时更新。
+> 普通租户数据使用的 `api_key` 仍是另一把 user/admin 凭据。
+
+### 配置重载边界
+
+服务端只在进程启动时读取 `ov.conf`，不会监听文件变化。修改 `embedding`、
+`vlm`、`rerank`、`retrieval`、`storage` 或 `server` 配置后，需要重启
+OpenViking 服务。已经运行中的队列任务不会自动迁移到新配置；请使用部署环境
+原有的服务管理方式重启，并在服务恢复后运行 `openviking-server doctor` 验证。
+
+`ovcli.conf` 属于客户端配置。新的 `ov` 命令或新建的 HTTP client 会读取当前
+文件；已经运行中的 client 或插件可能继续使用构造时加载的连接与凭据，修改后
+应重启对应客户端或插件。
+
 如果配置文件在其他位置，有两种指定方式：
 
 ```bash
@@ -1291,14 +1323,18 @@ openviking-server --config /path/to/ov.conf
 ```json
 {
   "memory": {
-    "version": "v2"
+    "custom_templates_dir": "/path/to/custom-memory"
   }
 }
 ```
 
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
-| `version` | 记忆实现版本。仅支持 `"v2"`（#2264 已移除旧版 `"v1"`；传入 `"v1"` 会在配置加载时抛出 `ValueError`）。 | `"v2"` |
+| `version` | 已废弃且会被忽略。OpenViking 始终使用 v3 记忆抽取链路；已有配置中保留该字段仍可正常加载，不会报错。 | `"v3"` |
+| `custom_templates_dir` | 自定义 memory templates 目录。设置后会在内置模板之外加载该目录中的模板。 | `""` |
+| `extraction_enabled` | session commit 时是否执行长期记忆抽取。 | `true` |
+| `session_skill_extraction_enabled` | session commit 时是否同时抽取可复用 skill 到当前用户的 skill 目录。 | `false` |
+| `link_enabled` | 记忆抽取是否写入和解析 memory links。 | `false` |
 
 ### ovcli.conf
 
@@ -1573,6 +1609,7 @@ Task 记录文件位于所属账号的系统目录：
     "api_key": "string",
     "model": "string",
     "api_base": "string",
+    "max_input_tokens": 0,
     "threshold": 0.1,
     "extra_headers": {}
   },

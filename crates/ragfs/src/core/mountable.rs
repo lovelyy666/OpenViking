@@ -21,12 +21,14 @@ const PATH_LOCK_FILE: &str = ".path.ovlock";
 
 use super::encryption_wrapper::EncryptionWrappedFS;
 use super::errors::{Error, Result};
-use super::filesystem::FileSystem;
+use super::filesystem::{sort_directory_entries, FileSystem};
 use super::multibackend_wrapper::MultiWriteWrappedFS;
 use super::plugin::ServicePlugin;
 use super::stats::{FilesystemStats, StatsCollector};
 use super::stats_wrapper::StatsWrappedFS;
-use super::types::{BackendsConfig, FileInfo, GrepResult, PluginConfig, TreeEntry, WriteFlag};
+use super::types::{
+    BackendsConfig, FileInfo, GlobPage, GrepResult, PluginConfig, TreeEntry, WriteFlag,
+};
 #[cfg(feature = "cache")]
 use crate::cache::{
     CacheNamespace, CachePolicy, CacheProvider, CacheTraversalMode, CachedFileSystem,
@@ -286,7 +288,8 @@ impl MountableFS {
             None => {
                 // Single backend: initialize plugin, optionally wrap raw storage with cache, then
                 // wrap with encryption. This keeps shared cache providers ciphertext-only.
-                // Control plugins (queuefs, serverinfofs) are never encrypted.
+                // Control plugins (queuefs, serverinfofs) are dynamic virtual filesystems; never
+                // cache or encrypt them.
                 let raw = plugin.initialize(config.clone()).await?;
                 let raw_arc: Arc<dyn FileSystem> = Arc::from(raw);
                 let is_control_plugin = matches!(config.name.as_str(), "queuefs" | "serverinfofs");
@@ -301,7 +304,11 @@ impl MountableFS {
                     .await?;
                 }
                 #[cfg(feature = "cache")]
-                let storage_fs = self.maybe_wrap_cache(raw_arc.clone(), &normalized_path);
+                let storage_fs = if is_control_plugin {
+                    raw_arc.clone()
+                } else {
+                    self.maybe_wrap_cache(raw_arc.clone(), &normalized_path)
+                };
                 #[cfg(not(feature = "cache"))]
                 let storage_fs = raw_arc.clone();
 
@@ -758,6 +765,7 @@ impl FileSystem for MountableFS {
         let (mount_info, rel_path) = self.find_mount(path).await?;
         let mut entries = mount_info.fs.read_dir(&rel_path).await?;
         entries.retain(|e| e.name != PATH_LOCK_FILE);
+        sort_directory_entries(&mut entries);
         Ok(entries)
     }
 
@@ -903,6 +911,56 @@ impl FileSystem for MountableFS {
 
         Ok(entries)
     }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        let (mount_info, rel_path) = self.find_mount(path).await?;
+
+        let mount_prefix = if mount_info.path == "/" {
+            String::new()
+        } else {
+            mount_info.path.clone()
+        };
+
+        let mut page = mount_info
+            .fs
+            .glob_directory(
+                &rel_path,
+                pattern,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+            .await?;
+
+        for entry in &mut page.entries {
+            if !mount_prefix.is_empty() {
+                entry.path = if entry.path == "/" {
+                    mount_prefix.clone()
+                } else {
+                    format!("{}{}", mount_prefix, entry.path)
+                };
+            }
+        }
+
+        page.entries.retain(|entry| {
+            entry
+                .path
+                .rsplit('/')
+                .next()
+                .map_or(true, |name| name != PATH_LOCK_FILE)
+        });
+
+        Ok(page)
+    }
 }
 
 #[cfg(test)]
@@ -1015,7 +1073,11 @@ mod tests {
         }
 
         async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
-            Ok(vec![])
+            Ok(self
+                .tree_entries
+                .iter()
+                .map(|entry| entry.info.clone())
+                .collect())
         }
 
         async fn stat(&self, path: &str) -> Result<FileInfo> {
@@ -1282,6 +1344,52 @@ mod tests {
             b"backend:/file.txt"
         );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn queuefs_mount_bypasses_cache_even_when_cache_is_configured() {
+        use crate::cache::{CacheNamespace, CachePolicy, MemoryCacheProvider};
+        use crate::plugins::QueueFSPlugin;
+
+        let provider = Arc::new(MemoryCacheProvider::new());
+        let mfs = MountableFS::with_cache(
+            provider.clone(),
+            CacheNamespace::new("queue-cache-test"),
+            CachePolicy::default().with_bypass_prefix("/queue"),
+        );
+        mfs.register_plugin(QueueFSPlugin::new()).await;
+        mfs.mount(PluginConfig::single_backend(
+            "queuefs",
+            "/queue",
+            HashMap::new(),
+        ))
+        .await
+        .unwrap();
+        mfs.mkdir("/queue/Embedding", 0o755).await.unwrap();
+
+        assert_eq!(
+            mfs.read("/queue/Embedding/size", 0, 0).await.unwrap(),
+            b"0"
+        );
+        mfs.write(
+            "/queue/Embedding/enqueue",
+            br#"{"id":"one"}"#,
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mfs.read("/queue/Embedding/size", 0, 0).await.unwrap(),
+            b"1",
+            "queuefs size is dynamic and must not be served from cache"
+        );
+        assert!(
+            provider.keys().await.is_empty(),
+            "queuefs control filesystem should not populate shared cache"
+        );
     }
 
     #[cfg(feature = "cache")]
@@ -1664,6 +1772,32 @@ mod tests {
             },
             extra: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_dir_sorts_dirs_first_then_name() {
+        let mfs = MountableFS::new();
+        let plugin = MockPlugin::with_tree_entries(
+            "sorted",
+            vec![
+                make_tree_entry("/b.txt", "b.txt", "b.txt", false),
+                make_tree_entry("/A.txt", "A.txt", "A.txt", false),
+                make_tree_entry("/c", "c", "c", true),
+                make_tree_entry("/B", "B", "B", true),
+            ],
+        );
+        mfs.register_plugin(plugin).await;
+        mfs.mount(test_config("sorted", "/sorted")).await.unwrap();
+
+        let names: Vec<String> = mfs
+            .read_dir("/sorted")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names, vec!["B", "c", "A.txt", "b.txt"]);
     }
 
     #[tokio::test]

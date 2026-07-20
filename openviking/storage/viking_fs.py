@@ -22,7 +22,6 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
 from openviking.core.context import ContextLevel
@@ -40,6 +39,7 @@ from openviking.pyagfs.exceptions import (
     AGFSClientError,
     AGFSDirectoryNotEmptyError,
     AGFSHTTPError,
+    AGFSInvalidOperationError,
     AGFSNotSupportedError,
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
@@ -55,6 +55,7 @@ from openviking.storage.internal_names import (
     STORAGE_INTERNAL_ENTRY_NAMES,
 )
 from openviking.telemetry import get_current_telemetry
+from openviking.utils.image_search import build_multimodal_embedding_input
 from openviking.utils.time_utils import format_iso8601, get_current_timestamp, parse_iso_datetime
 from openviking_cli.exceptions import (
     FailedPreconditionError,
@@ -85,9 +86,9 @@ LS_ALL_NODES = 2**31 - 1
 _T = TypeVar("_T")
 
 
-def _ensure_non_empty_search_query(query: str) -> None:
-    if not query.strip():
-        raise InvalidArgumentError("Search query must not be empty.")
+def _ensure_non_empty_search_query(query: str, image_url: Optional[str] = None) -> None:
+    if not query.strip() and not image_url:
+        raise InvalidArgumentError("Search query or image_url must not be empty.")
 
 
 def _is_directory_not_empty_error(message: str) -> bool:
@@ -717,6 +718,10 @@ class VikingFS:
                         details={"from_uri": old_uri, "to_uri": new_uri},
                     )
 
+        real_ctx = self._ctx_or_default(ctx)
+        old_uri = canonicalize_uri(old_uri, real_ctx)
+        new_uri = canonicalize_uri(new_uri, real_ctx)
+
         lock_context = (
             LockContext(
                 get_lock_manager(),
@@ -735,7 +740,7 @@ class VikingFS:
             )
         )
 
-        async with lock_context:
+        async with lock_context as active_lock_handle:
             uris_to_move = await self._collect_uris(old_path, recursive=True, ctx=ctx)
             uris_to_move.append(target_uri)
 
@@ -752,6 +757,7 @@ class VikingFS:
                     is_dir=is_dir,
                     is_temp=is_temp,
                     ctx=ctx,
+                    lock_handle=active_lock_handle,
                 )
             except Exception as e:
                 if "not found" in str(e).lower():
@@ -817,6 +823,7 @@ class VikingFS:
         is_dir: bool,
         is_temp: bool,
         ctx: Optional[RequestContext] = None,
+        lock_handle: Optional["LockHandle"] = None,
     ) -> None:
         """Copy source to destination for mv without deleting source."""
         if is_temp:
@@ -829,15 +836,23 @@ class VikingFS:
             return
 
         if is_dir:
-            await self._copy_dir_through_vikingfs(old_uri, new_uri, ctx=ctx)
+            await self._copy_dir_through_vikingfs(
+                old_uri, new_uri, ctx=ctx, lock_handle=lock_handle
+            )
         else:
-            await self._copy_file_through_vikingfs(old_uri, new_uri, ctx=ctx)
+            await self._copy_file_through_vikingfs(
+                old_uri,
+                new_uri,
+                ctx=ctx,
+                lock_handle=lock_handle,
+            )
 
     async def _copy_dir_through_vikingfs(
         self,
         old_uri: str,
         new_uri: str,
         ctx: Optional[RequestContext] = None,
+        lock_handle: Optional["LockHandle"] = None,
     ) -> None:
         """Recursively copy a directory through VikingFS read/write hooks."""
         await self.mkdir(new_uri, exist_ok=True, ctx=ctx)
@@ -850,19 +865,30 @@ class VikingFS:
             old_child_uri = f"{old_uri.rstrip('/')}/{name}"
             new_child_uri = f"{new_uri.rstrip('/')}/{name}"
             if entry.get("isDir"):
-                await self._copy_dir_through_vikingfs(old_child_uri, new_child_uri, ctx=ctx)
+                await self._copy_dir_through_vikingfs(
+                    old_child_uri,
+                    new_child_uri,
+                    ctx=ctx,
+                    lock_handle=lock_handle,
+                )
             else:
-                await self._copy_file_through_vikingfs(old_child_uri, new_child_uri, ctx=ctx)
+                await self._copy_file_through_vikingfs(
+                    old_child_uri,
+                    new_child_uri,
+                    ctx=ctx,
+                    lock_handle=lock_handle,
+                )
 
     async def _copy_file_through_vikingfs(
         self,
         from_uri: str,
         to_uri: str,
         ctx: Optional[RequestContext] = None,
+        lock_handle: Optional["LockHandle"] = None,
     ) -> None:
         """Copy one file through VikingFS read/write hooks without deleting source."""
         content_bytes = await self.read_file_bytes(from_uri, ctx=ctx)
-        await self.write_file_bytes(to_uri, content_bytes, ctx=ctx)
+        await self.write_file_bytes(to_uri, content_bytes, ctx=ctx, lock_handle=lock_handle)
 
     async def grep(
         self,
@@ -897,6 +923,10 @@ class VikingFS:
         Returns:
             Dict with matches, count, match_count, files_scanned
         """
+        real_ctx = self._ctx_or_default(ctx)
+        uri = canonicalize_uri(uri, real_ctx)
+        if exclude_uri:
+            exclude_uri = canonicalize_uri(exclude_uri, real_ctx)
         self._ensure_access(uri, ctx)
         # Skip vector_store.count() — the count field is not needed for grep,
         # and avoiding it saves one VikingDB API call.
@@ -946,6 +976,8 @@ class VikingFS:
             return "fs"
 
         backend_type = getattr(vector_store, "_backend_type", "unknown")
+        # Keep this set consistent with ``CollectionAdapter.USE_CONTENT_FIELD``:
+        # only these backends store the ``content`` field required for full-text grep.
         if backend_type not in ("volcengine", "vikingdb"):
             return "fs"
 
@@ -1070,7 +1102,7 @@ class VikingFS:
         filter_expr = PathScope("uri", uri, depth=level_limit)
         excluded_prefix = None
         if exclude_uri:
-            excluded_prefix = self._normalize_uri(exclude_uri).rstrip("/")
+            excluded_prefix = exclude_uri.rstrip("/")
             self._ensure_access(excluded_prefix, ctx)
             filter_expr = And(
                 [
@@ -1216,7 +1248,7 @@ class VikingFS:
 
         excluded_path = None
         if exclude_uri:
-            normalized_excluded_uri = self._normalize_uri(exclude_uri).rstrip("/")
+            normalized_excluded_uri = exclude_uri.rstrip("/")
             self._ensure_access(normalized_excluded_uri, ctx)
             excluded_path = self._uri_to_path(normalized_excluded_uri, ctx=ctx)
 
@@ -1313,7 +1345,7 @@ class VikingFS:
         compiled_pattern = re.compile(pattern, flags)
         excluded_prefix = None
         if exclude_uri:
-            excluded_prefix = self._normalize_uri(exclude_uri).rstrip("/")
+            excluded_prefix = exclude_uri.rstrip("/")
             self._ensure_access(excluded_prefix, ctx)
         file_uris = await self._collect_grep_files(
             uri,
@@ -1348,7 +1380,7 @@ class VikingFS:
             if current_depth > level_limit:
                 return
 
-            normalized_current_uri = self._normalize_uri(current_uri)
+            normalized_current_uri = current_uri
             if excluded_prefix and (
                 normalized_current_uri == excluded_prefix
                 or normalized_current_uri.startswith(excluded_prefix + "/")
@@ -1374,7 +1406,7 @@ class VikingFS:
                 else:
                     file_uris.append(entry_uri)
 
-        normalized_uri = self._normalize_uri(uri)
+        normalized_uri = uri
         if excluded_prefix and (
             normalized_uri == excluded_prefix or normalized_uri.startswith(excluded_prefix + "/")
         ):
@@ -1447,12 +1479,6 @@ class VikingFS:
         if match_file == ".":
             return base_path
         return f"{base_path.rstrip('/')}/{match_file.lstrip('/')}"
-
-    def _calculate_grep_match_depth(self, match_file: str) -> int:
-        """Calculate relative depth from a grep result path relative to the query root."""
-        if not match_file or match_file == ".":
-            return 0
-        return len([part for part in match_file.split("/") if part])
 
     async def stat(
         self, uri: str, ctx: Optional[RequestContext] = None, skip_count: bool = False
@@ -1560,15 +1586,60 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive."""
-        entries = await self.tree(uri, node_limit=1000000, level_limit=None, ctx=ctx)
+        _ensure_non_empty_search_query(pattern)
+        self._ensure_access(uri, ctx)
+        real_ctx = self._ctx_or_default(ctx)
+        primary_path = self._uri_to_path(uri, ctx=ctx)
+        path: Optional[str] = None
+        for candidate_path in self._read_paths(uri, ctx=ctx):
+            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
+                continue
+            if await self._agfs_path_exists(candidate_path):
+                path = candidate_path
+                break
+        if path is None:
+            if self._is_legacy_session_root_uri(uri):
+                return {"matches": [], "count": 0}
+            raise NotFoundError(uri, "directory")
+
+        page_size = self._glob_page_size(node_limit)
+        continuation_token: Optional[str] = None
         matches = []
-        for entry in entries:
-            rel_path = entry.get("rel_path", "")
-            if PurePath(rel_path).match(pattern):
-                matches.append(entry["uri"])
-        # Now apply node limit to the filtered matches
-        if node_limit is not None and node_limit > 0:
-            matches = matches[:node_limit]
+        while True:
+            page = await self._async_agfs.glob_directory(
+                path,
+                pattern,
+                show_hidden=False,
+                page_size=page_size,
+                level_limit=None,
+                continuation_token=continuation_token,
+            )
+
+            for entry in page.get("entries", []):
+                if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+                    return {"matches": matches, "count": len(matches)}
+                if not self._is_path_entry_visible(
+                    entry["path"],
+                    entry.get("name") or entry["path"].rsplit("/", 1)[-1],
+                    path,
+                    real_ctx,
+                ):
+                    continue
+                if not await self._read_path_visible(uri, entry["path"], primary_path, real_ctx):
+                    continue
+                entry_uri = self._alias_uri_for_path(
+                    request_uri=uri,
+                    base_path=path,
+                    entry_path=entry["path"],
+                    ctx=ctx,
+                )
+                matches.append(entry_uri)
+
+            if node_limit is not None and node_limit > 0 and len(matches) >= node_limit:
+                return {"matches": matches, "count": len(matches)}
+            continuation_token = page.get("next_token")
+            if not continuation_token:
+                break
         return {"matches": matches, "count": len(matches)}
 
     async def _batch_fetch_abstracts(
@@ -1916,6 +1987,7 @@ class VikingFS:
         filter: Optional[Dict] = None,
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
+        image_url: Optional[str] = None,
     ):
         """Semantic search.
 
@@ -1929,7 +2001,7 @@ class VikingFS:
         Returns:
             FindResult
         """
-        _ensure_non_empty_search_query(query)
+        _ensure_non_empty_search_query(query, image_url)
         telemetry = get_current_telemetry()
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking_cli.retrieve import (
@@ -1964,6 +2036,10 @@ class VikingFS:
             context_type=None,
             intent="",
             target_directories=retrieval_targets.target_directories,
+            embedding_input=(
+                build_multimodal_embedding_input(query, image_url) if image_url else None
+            ),
+            image_query=bool(image_url),
         )
 
         logger.debug(
@@ -2008,6 +2084,7 @@ class VikingFS:
         filter: Optional[Dict] = None,
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
+        image_url: Optional[str] = None,
     ):
         """Complex search with session context.
 
@@ -2021,7 +2098,7 @@ class VikingFS:
         Returns:
             FindResult
         """
-        _ensure_non_empty_search_query(query)
+        _ensure_non_empty_search_query(query, image_url)
         telemetry = get_current_telemetry()
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking.retrieve.intent_analyzer import IntentAnalyzer
@@ -2055,7 +2132,19 @@ class VikingFS:
                 target_abstract = ""
 
         # With session context: intent analysis
-        if session_summary or current_messages:
+        if image_url:
+            typed_queries = [
+                TypedQuery(
+                    query=query,
+                    context_type=None,
+                    intent="",
+                    priority=1,
+                    target_directories=retrieval_targets.target_directories,
+                    embedding_input=build_multimodal_embedding_input(query, image_url),
+                    image_query=True,
+                )
+            ]
+        elif session_summary or current_messages:
             analyzer = IntentAnalyzer(max_recent_messages=5)
             with telemetry.measure("search.intent_analysis"):
                 query_plan = await analyzer.analyze(
@@ -2231,25 +2320,15 @@ class VikingFS:
                 return True
         return False
 
-    def _is_tree_entry_visible(
-        self, entry: Dict[str, Any], base_path: str, ctx: RequestContext
+    def _is_path_entry_visible(
+        self, entry_path: str, name: str, base_path: str, ctx: RequestContext
     ) -> bool:
-        """Check visibility for a single TreeEntry returned by Rust tree_directory.
-
-        Applies three layers of filtering:
-        1. Ancestor chain — if any ancestor directory would be filtered by _ls_entries,
-           all descendants are invisible.
-        2. Self — the entry's own name must pass _ls_entries at its parent level.
-        3. ACL — the entry must be accessible by the requesting context.
-        """
-        entry_path = entry["path"]
-
+        """Check visibility for one flattened path entry returned by Rust."""
         if self._ancestor_is_filtered(entry_path, base_path):
             return False
 
         entry_parts = [p for p in entry_path.strip("/").split("/") if p]
         if entry_parts:
-            name = entry_parts[-1]
             parent_parts = entry_parts[:-1]
             parent_path = "/" + "/".join(parent_parts) if parent_parts else "/"
             if not self._is_name_visible_at_path(name, parent_path):
@@ -2261,10 +2340,26 @@ class VikingFS:
 
         return True
 
+    def _is_tree_entry_visible(
+        self, entry: Dict[str, Any], base_path: str, ctx: RequestContext
+    ) -> bool:
+        """Check visibility for a single TreeEntry returned by Rust tree_directory."""
+        entry_path = entry["path"]
+        entry_info = entry.get("info", {})
+        name = entry_info.get("name") or entry_path.rstrip("/").rsplit("/", 1)[-1]
+        return self._is_path_entry_visible(entry_path, name, base_path, ctx)
+
     # Over-fetch multiplier for bounded tree traversal. When a node_limit is
     # set, we push down node_limit * this factor as the raw-node limit to Rust,
     # leaving headroom for ACL/internal-name filtering before re-fetching.
     _TREE_OVERFETCH_FACTOR = 4
+    _GLOB_PAGE_SIZE_DEFAULT = 1024
+
+    def _glob_page_size(self, node_limit: Optional[int]) -> int:
+        """Return the backend page size used by glob_directory."""
+        if node_limit is None or node_limit <= 0:
+            return self._GLOB_PAGE_SIZE_DEFAULT
+        return node_limit
 
     async def _iter_visible_tree_entries(
         self,
@@ -2462,21 +2557,32 @@ class VikingFS:
         entry_path: str,
         ctx: Optional[RequestContext],
     ) -> str:
-        normalized_request, request_parts = self._normalized_uri_parts(request_uri)
-        # Only legacy namespaces need alias remapping:
-        # - Old format viking://agent/{agent_id}/...
-        # - viking://session/...
-        is_legacy_namespace = request_parts and (
-            request_parts[0] == "session"
-            or (request_parts[0] == "agent" and self._is_legacy_agent_id_uri(request_uri))
-        )
-        if not is_legacy_namespace:
-            return self._path_to_uri(entry_path, ctx=ctx)
         base = base_path.rstrip("/")
+        normalized_request, request_parts = self._normalized_uri_parts(request_uri)
+        request_root = (
+            normalized_request
+            if normalized_request == "viking://"
+            else normalized_request.rstrip("/")
+        )
+        preserve_request_alias = normalized_request in {"viking://", "viking://user"} or bool(
+            request_parts
+            and (
+                request_parts[0] == "session"
+                or (request_parts[0] == "agent" and self._is_legacy_agent_id_uri(request_uri))
+            )
+        )
         rel_path = entry_path[len(base) :].strip("/") if entry_path.startswith(base) else ""
-        if not rel_path:
-            return normalized_request.rstrip("/")
-        return f"{normalized_request.rstrip('/')}/{rel_path}"
+        if entry_path.startswith(base):
+            separator = "" if request_root.endswith("://") else "/"
+            candidate_uri = request_root if not rel_path else f"{request_root}{separator}{rel_path}"
+            if preserve_request_alias:
+                return candidate_uri
+            try:
+                if self._uri_to_path(candidate_uri, ctx=ctx) == entry_path:
+                    return candidate_uri
+            except Exception:
+                pass
+        return self._path_to_uri(entry_path, ctx=ctx)
 
     async def _agfs_path_exists(self, path: str) -> bool:
         try:
@@ -2779,21 +2885,6 @@ class VikingFS:
                 except UnicodeDecodeError:
                     return data.decode("utf-8", errors="replace")
 
-    def _handle_agfs_content(self, result: Union[bytes, Any, None]) -> str:
-        """Handle AGFSClient content return types consistently."""
-        if isinstance(result, bytes):
-            return self._decode_bytes(result)
-        elif hasattr(result, "content") and result.content is not None:
-            return self._decode_bytes(result.content)
-        elif result is None:
-            return ""
-        else:
-            # Try to convert to string
-            try:
-                return str(result)
-            except Exception:
-                return ""
-
     # ========== Vector Sync Helper Methods ==========
 
     async def _collect_uris(
@@ -2846,7 +2937,6 @@ class VikingFS:
         old_base: str,
         new_base: str,
         ctx: Optional[RequestContext] = None,
-        levels: Optional[List[int]] = None,
     ) -> None:
         """Update URIs in vector store (when moving files).
 
@@ -2856,82 +2946,19 @@ class VikingFS:
         if not vector_store:
             return
 
-        old_base_uri = self._path_to_uri(old_base, ctx=ctx)
-        new_base_uri = self._path_to_uri(new_base, ctx=ctx)
+        real_ctx = self._ctx_or_default(ctx)
 
         for uri in uris:
             try:
-                new_uri = uri.replace(old_base_uri, new_base_uri, 1)
-
-                await vector_store.update_uri_mapping(
-                    ctx=self._ctx_or_default(ctx),
+                new_uri = new_base + uri[len(old_base) :]
+                if await vector_store.update_uri_mapping(
+                    ctx=real_ctx,
                     uri=uri,
                     new_uri=new_uri,
-                    levels=levels,
-                )
-                logger.debug(f"[VikingFS] Updated URI: {uri} -> {new_uri}")
+                ):
+                    logger.debug(f"[VikingFS] Updated URI: {uri} -> {new_uri}")
             except Exception as e:
                 logger.warning(f"[VikingFS] Failed to update {uri} in vector store: {e}")
-
-    async def _mv_vector_store_l0_l1(
-        self,
-        old_uri: str,
-        new_uri: str,
-        ctx: Optional[RequestContext] = None,
-        lock_handle: Optional["LockHandle"] = None,
-    ) -> None:
-        from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
-        from openviking.storage.transaction import LockContext, get_lock_manager
-
-        self._ensure_access(old_uri, ctx)
-        self._ensure_access(new_uri, ctx)
-
-        real_ctx = self._ctx_or_default(ctx)
-        old_dir = VikingURI.normalize(old_uri).rstrip("/")
-        new_dir = VikingURI.normalize(new_uri).rstrip("/")
-        if old_dir == new_dir:
-            return
-
-        for uri in (old_dir, new_dir):
-            if uri.endswith(("/.abstract.md", "/.overview.md")):
-                raise ValueError(f"mv_vector_store expects directory URIs, got: {uri}")
-
-        try:
-            old_stat = await self.stat(old_dir, ctx=real_ctx)
-        except Exception as e:
-            raise FileNotFoundError(f"mv_vector_store old_uri not found: {old_dir}") from e
-        try:
-            new_stat = await self.stat(new_dir, ctx=real_ctx)
-        except Exception as e:
-            raise FileNotFoundError(f"mv_vector_store new_uri not found: {new_dir}") from e
-
-        if not (isinstance(old_stat, dict) and old_stat.get("isDir", False)):
-            raise ValueError(f"mv_vector_store expects old_uri to be a directory: {old_dir}")
-        if not (isinstance(new_stat, dict) and new_stat.get("isDir", False)):
-            raise ValueError(f"mv_vector_store expects new_uri to be a directory: {new_dir}")
-
-        old_path = self._uri_to_path(old_dir, ctx=real_ctx)
-        new_path = self._uri_to_path(new_dir, ctx=real_ctx)
-
-        try:
-            async with LockContext(
-                get_lock_manager(),
-                [old_path],
-                lock_mode="mv",
-                mv_dst_path=new_path,
-                src_is_dir=True,
-                handle=lock_handle,
-            ):
-                await self._update_vector_store_uris(
-                    uris=[old_dir],
-                    old_base=old_dir,
-                    new_base=new_dir,
-                    ctx=real_ctx,
-                    levels=[0, 1],
-                )
-
-        except LockAcquisitionError:
-            raise ResourceBusyError(f"Resource is being processed: {old_dir}", uri=old_dir)
 
     def _get_vector_store(self) -> Optional["VikingVectorIndexBackend"]:
         """Get vector store instance."""
@@ -3214,6 +3241,8 @@ class VikingFS:
         abs_limit: int = 256,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -3225,6 +3254,8 @@ class VikingFS:
             abs_limit: int = 256
             show_all_hidden: bool = False (list all hidden files, like -a)
             node_limit: int = 1000 (maximum number of nodes to list)
+            sort_by: Optional sort field, "name" or "mtime"
+            sort_order: Sort direction, "asc" or "desc"
 
         output="original"
         [{'name': '.abstract.md', 'size': 100, 'mode': 420, 'modTime': '2026-02-11T16:52:16.256334192+08:00', 'isDir': False, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': None}, 'uri': 'viking://resources/.abstract.md'}]
@@ -3233,12 +3264,90 @@ class VikingFS:
         [{'name': '.abstract.md', 'size': 100, 'modTime': '2026-02-11T08:52:16.256Z', 'isDir': False, 'uri': 'viking://resources/.abstract.md', 'abstract': "..."}]
         """
         self._ensure_access(uri, ctx)
+        if sort_by not in {None, "name", "mtime"}:
+            raise ValueError("sort_by must be 'name' or 'mtime'")
+        if sort_order not in {"asc", "desc"}:
+            raise ValueError("sort_order must be 'asc' or 'desc'")
         if output == "original":
-            return await self._ls_original(uri, show_all_hidden, node_limit, ctx=ctx)
+            return await self._ls_original(
+                uri,
+                show_all_hidden,
+                node_limit,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                ctx=ctx,
+            )
         elif output == "agent":
-            return await self._ls_agent(uri, abs_limit, show_all_hidden, node_limit, ctx=ctx)
+            return await self._ls_agent(
+                uri,
+                abs_limit,
+                show_all_hidden,
+                node_limit,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                ctx=ctx,
+            )
         else:
             raise ValueError(f"Invalid output format: {output}")
+
+    @staticmethod
+    def _ls_entry_mtime(entry: Dict[str, Any]) -> Optional[float]:
+        raw_time = entry.get("modTime")
+        if isinstance(raw_time, (int, float)):
+            return float(raw_time)
+        if isinstance(raw_time, str) and raw_time:
+            try:
+                return parse_iso_datetime(raw_time).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        legacy_time = entry.get("mtime")
+        if isinstance(legacy_time, (int, float)):
+            return float(legacy_time)
+        return None
+
+    @classmethod
+    def _sort_ls_entry_items(
+        cls,
+        entry_items: List[tuple[Dict[str, Any], str]],
+        sort_by: Optional[str],
+        sort_order: str,
+    ) -> List[tuple[Dict[str, Any], str]]:
+        if sort_by is None:
+            return entry_items
+
+        descending = sort_order == "desc"
+        directories = [item for item in entry_items if item[0].get("isDir", False)]
+        files = [item for item in entry_items if not item[0].get("isDir", False)]
+
+        if sort_by == "name":
+
+            def name_key(item: tuple[Dict[str, Any], str]) -> tuple[str, str]:
+                name = str(item[0].get("name", ""))
+                return name.lower(), name
+
+            directories.sort(key=name_key, reverse=descending)
+            files.sort(key=name_key, reverse=descending)
+            return directories + files
+
+        def sort_by_mtime(
+            items: List[tuple[Dict[str, Any], str]],
+        ) -> List[tuple[Dict[str, Any], str]]:
+            timestamped = []
+            missing = []
+            for item in items:
+                timestamp = cls._ls_entry_mtime(item[0])
+                if timestamp is None:
+                    missing.append(item)
+                else:
+                    timestamped.append((timestamp, item))
+            timestamped.sort(
+                key=lambda pair: pair[0],
+                reverse=descending,
+            )
+            return [item for _, item in timestamped] + missing
+
+        return sort_by_mtime(directories) + sort_by_mtime(files)
 
     async def _ls_agent(
         self,
@@ -3246,11 +3355,14 @@ class VikingFS:
         abs_limit: int,
         show_all_hidden: bool,
         node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
     ) -> List[Dict[str, Any]]:
         """List directory contents (URI version)."""
         real_ctx = self._ctx_or_default(ctx)
         entry_items = await self._list_read_path_items(uri, ctx=ctx)
+        entry_items = self._sort_ls_entry_items(entry_items, sort_by, sort_order)
         # basic info
         fallback_time = datetime.now(timezone.utc)
         all_entries = []
@@ -3292,12 +3404,15 @@ class VikingFS:
         uri: str,
         show_all_hidden: bool = False,
         node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
         ctx: Optional[RequestContext] = None,
     ) -> List[Dict[str, Any]]:
         """List directory contents (URI version)."""
         real_ctx = self._ctx_or_default(ctx)
         try:
             entry_items = await self._list_read_path_items(uri, ctx=ctx)
+            entry_items = self._sort_ls_entry_items(entry_items, sort_by, sort_order)
             # AGFS returns read-only structure, need to create new dict
             all_entries = []
             for entry, entry_uri in entry_items:
@@ -3485,6 +3600,17 @@ class VikingFS:
     _DEFAULT_GIT_AUTHOR_NAME = "viking-bot"
     _DEFAULT_GIT_AUTHOR_EMAIL = "bot@viking.local"
 
+    _OVGITIGNORE_TREE_PATH = ".ovgitignore"
+
+    # Must stay in sync with `OVGITIGNORE_MAX_BYTES` in the Rust layer
+    # (`crates/ragfs/src/git/ignore.rs`); enforced here at write time so a bad
+    # file can never be persisted only to poison every later commit.
+    _OVGITIGNORE_MAX_BYTES = 64 * 1024
+
+    def _gitignore_agfs_path(self, ctx: Optional[RequestContext] = None) -> str:
+        real_ctx = self._ctx_or_default(ctx)
+        return f"/local/{real_ctx.account_id}/{self._OVGITIGNORE_TREE_PATH}"
+
     def _uri_to_tree_path(self, uri: str, ctx: Optional[RequestContext] = None) -> str:
         """Convert a viking:// URI to an account-relative git tree path.
 
@@ -3521,7 +3647,7 @@ class VikingFS:
         ".abstract.md": ContextLevel.ABSTRACT,
         ".overview.md": ContextLevel.OVERVIEW,
     }
-    _NO_VECTOR_DERIVED = frozenset({".relations.json"})
+    _NO_VECTOR_DERIVED = frozenset({".relations.json", ".ovgitignore"})
 
     def _classify_restore_path(self, tree_path: str, *, deleted: bool) -> Optional[tuple]:
         """Classify a restore-affected tree path into a vector maintenance task.
@@ -3555,6 +3681,72 @@ class VikingFS:
         op = "delete" if deleted else "reindex_file"
         return (op, file_uri, ContextLevel.DETAIL)
 
+    async def get_gitignore(self, ctx: Optional[RequestContext] = None) -> str:
+        """Return the account-level .ovgitignore content, or an empty string if absent.
+
+        Raises ``AGFSInvalidOperationError`` if the stored content is not valid
+        UTF-8, mirroring the Rust layer's reject-non-UTF-8 behavior at commit
+        time rather than leaking a raw ``UnicodeDecodeError``.
+        """
+        path = self._gitignore_agfs_path(ctx)
+        try:
+            raw = await self._async_agfs.read(path, 0, -1)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return ""
+            mapped = map_exception(exc, resource=path)
+            if mapped is not None:
+                raise mapped from exc
+            raise
+        if isinstance(raw, bytes):
+            data = raw
+        elif raw is not None and hasattr(raw, "content"):
+            data = raw.content
+        else:
+            data = b""
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AGFSInvalidOperationError(
+                f"invalid ignore file {path}: must be UTF-8: {exc}"
+            ) from exc
+
+    async def set_gitignore(
+        self,
+        content: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        """Write the account-level .ovgitignore control file without semantic indexing.
+
+        Validates the size limit up front so a too-large file can never be
+        persisted only to make every later ``commit`` fail. Syntax (negation,
+        escaping) is still validated at commit time by the Rust layer.
+        """
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        path = self._gitignore_agfs_path(ctx)
+        data = content.encode("utf-8")
+        if len(data) > self._OVGITIGNORE_MAX_BYTES:
+            raise AGFSInvalidOperationError(
+                f"ignore file too large: {path} is {len(data)} bytes, "
+                f"limit {self._OVGITIGNORE_MAX_BYTES} bytes"
+            )
+        await self._ensure_parent_dirs(path, ctx=ctx)
+        await self._async_agfs.write(path, data)
+
+    async def delete_gitignore(self, ctx: Optional[RequestContext] = None) -> None:
+        """Delete the account-level .ovgitignore control file. Missing is success."""
+        path = self._gitignore_agfs_path(ctx)
+        try:
+            await self._async_agfs.rm(path, recursive=False)
+        except Exception as exc:
+            if is_not_found_error(exc):
+                return
+            mapped = map_exception(exc, resource=path)
+            if mapped is not None:
+                raise mapped from exc
+            raise
+
     async def commit(
         self,
         *,
@@ -3581,8 +3773,11 @@ class VikingFS:
             ctx: Request context (provides ``account_id``).
 
         Returns:
-            Dict with ``result`` (``"created"`` / ``"noop"``) and ``commit_oid``;
-            ``changed`` count when ``result == "created"``.
+            Dict with ``result`` (``"created"`` / ``"noop"``) and ``commit_oid``.
+            When ``result == "created"`` it also includes ``changed`` (paths
+            added/updated/removed). Both variants include ``ignored``: the
+            number of candidate paths skipped by the account ``.ovgitignore``
+            rules (system pruning is not counted). Noop omits ``changed``.
         """
         real_ctx = self._ctx_or_default(ctx)
         account = real_ctx.account_id
@@ -3853,6 +4048,7 @@ class VikingFS:
         *,
         branch: str = "main",
         limit: int = 20,
+        paths: Optional[List[str]] = None,
         ctx: Optional[RequestContext] = None,
     ) -> List[Dict[str, Any]]:
         """Walk back from ``branch``'s HEAD along ``parents[0]`` up to ``limit`` commits.
@@ -3863,25 +4059,18 @@ class VikingFS:
             return []
         real_ctx = self._ctx_or_default(ctx)
         account = real_ctx.account_id
-        head = await self._async_agfs.run(
-            "git_show",
-            account=account,
-            target_ref=branch,
-            path=None,
+        tree_paths = (
+            None
+            if not paths
+            else [self._uri_to_tree_path(path, ctx=real_ctx) for path in paths]
         )
-        results: List[Dict[str, Any]] = [head]
-        parents = head.get("parents") or []
-        while parents and len(results) < limit:
-            parent_oid = parents[0]
-            commit = await self._async_agfs.run(
-                "git_show",
-                account=account,
-                target_ref=parent_oid,
-                path=None,
-            )
-            results.append(commit)
-            parents = commit.get("parents") or []
-        return results
+        return await self._async_agfs.run(
+            "git_log",
+            account=account,
+            branch=branch,
+            limit=limit,
+            paths=tree_paths,
+        )
 
     def _collect_restore_vector_tasks(
         self,

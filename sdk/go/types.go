@@ -53,11 +53,18 @@ type AddSkillOptions struct {
 // AdminCreateAccountOptions controls AdminCreateAccountWithOptions.
 type AdminCreateAccountOptions struct {
 	UserConfig map[string]any
+	Seed       *string
 }
 
 // AdminRegisterUserOptions controls AdminRegisterUserWithOptions.
 type AdminRegisterUserOptions struct {
 	UserConfig map[string]any
+	Seed       *string
+}
+
+// AdminRegenerateKeyOptions controls AdminRegenerateKeyWithOptions.
+type AdminRegenerateKeyOptions struct {
+	Seed *string
 }
 
 // ListSkillsOptions controls ListSkills.
@@ -141,6 +148,8 @@ type ListOptions struct {
 	AbsLimit      int
 	ShowAllHidden bool
 	NodeLimit     int
+	SortBy        string
+	SortOrder     string
 }
 
 // TreeOptions controls Tree.
@@ -175,13 +184,15 @@ type SetTagsOptions struct {
 
 // ReindexOptions controls Reindex.
 type ReindexOptions struct {
-	Mode string
-	Wait bool
+	Mode   string
+	Wait   bool
+	DryRun bool
 }
 
 // FindOptions controls Find.
 type FindOptions struct {
 	TargetURI      any
+	Image          string
 	Limit          int
 	NodeLimit      *int
 	ScoreThreshold *float64
@@ -197,6 +208,7 @@ type FindOptions struct {
 // SearchOptions controls Search.
 type SearchOptions struct {
 	TargetURI      any
+	Image          string
 	SessionID      string
 	Limit          int
 	NodeLimit      *int
@@ -216,6 +228,11 @@ type GrepOptions struct {
 	NodeLimit       *int
 	LevelLimit      *int
 	ExcludeURI      string
+}
+
+// GlobOptions controls Glob.
+type GlobOptions struct {
+	NodeLimit *int
 }
 
 // CreateSessionOptions controls CreateSession.

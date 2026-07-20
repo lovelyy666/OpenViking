@@ -10,12 +10,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from vikingbot.agent.loop import AgentLoop  # noqa: E402
+from vikingbot.agent.subagent import SubagentManager  # noqa: E402
 from vikingbot.agent.tools.cron import CronTool  # noqa: E402
 from vikingbot.agent.tools.message import MessageTool  # noqa: E402
-from vikingbot.bus.events import OutboundMessage  # noqa: E402
+from vikingbot.agent.tools.spawn import SpawnTool  # noqa: E402
+from vikingbot.bus.events import InboundMessage, OutboundMessage  # noqa: E402
 from vikingbot.bus.queue import MessageBus  # noqa: E402
 from vikingbot.channels.feishu import FeishuChannel  # noqa: E402
-from vikingbot.config.schema import FeishuChannelConfig, SessionKey  # noqa: E402
+from vikingbot.config.schema import Config, FeishuChannelConfig, SessionKey  # noqa: E402
 from vikingbot.cron.service import CronService  # noqa: E402
 from vikingbot.cron.types import CronSchedule  # noqa: E402
 
@@ -39,6 +42,118 @@ async def test_message_tool_preserves_channel_metadata():
     assert result.startswith("Message sent")
     assert sent[0].metadata == metadata
     assert sent[0].metadata is not metadata
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_preserves_channel_metadata():
+    metadata = {"reply_to": "oc_chat", "chat_type": "group", "message_id": "om_old"}
+    connection = {"api_key": "request-key", "account_id": "acct", "user_id": "alice"}
+    calls = []
+
+    class FakeSubagentManager:
+        async def spawn(self, **kwargs):
+            calls.append(kwargs)
+            return "started"
+
+    tool = SpawnTool(manager=FakeSubagentManager())
+    context = SimpleNamespace(
+        session_key=SessionKey(type="feishu", channel_id="cli_app", chat_id="oc_chat"),
+        channel_metadata=metadata,
+        openviking_connection=connection,
+    )
+
+    result = await tool.execute(context, task="read files", label="read")
+
+    assert result == "started"
+    assert calls[0]["channel_metadata"] == metadata
+    assert calls[0]["openviking_connection"] is connection
+
+
+@pytest.mark.asyncio
+async def test_subagent_announcement_preserves_channel_metadata(tmp_path):
+    bus = MessageBus()
+    metadata = {"reply_to": "oc_chat", "chat_type": "group", "message_id": "om_old"}
+    connection = {"api_key": "request-key", "account_id": "acct", "user_id": "alice"}
+    session_key = SessionKey(type="feishu", channel_id="cli_app", chat_id="oc_chat")
+    manager = SubagentManager(
+        provider=SimpleNamespace(get_default_model=lambda: "fake-model"),
+        workspace=tmp_path,
+        bus=bus,
+        config=SimpleNamespace(),
+    )
+
+    await manager._announce_result(
+        "task-id",
+        "read",
+        "read files",
+        "done",
+        session_key,
+        "ok",
+        metadata,
+        connection,
+    )
+
+    inbound = await bus.consume_inbound()
+    assert inbound.metadata == metadata
+    assert inbound.metadata is not metadata
+    assert inbound.openviking_connection is connection
+
+
+@pytest.mark.asyncio
+async def test_system_message_response_preserves_channel_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(AgentLoop, "_register_builtin_hooks", lambda self: None)
+    monkeypatch.setattr(AgentLoop, "_register_default_tools", lambda self: None)
+    monkeypatch.setattr("vikingbot.agent.loop.SubagentManager", lambda **kwargs: SimpleNamespace())
+
+    metadata = {"reply_to": "oc_chat", "chat_type": "group", "message_id": "om_old"}
+    connection = {"api_key": "request-key", "account_id": "acct", "user_id": "alice"}
+    captured = {}
+    session_key = SessionKey(type="feishu", channel_id="cli_app", chat_id="oc_chat")
+    config = Config(storage_workspace=str(tmp_path / "data"))
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=SimpleNamespace(get_default_model=lambda: "fake-model"),
+        workspace=tmp_path / "workspace",
+        model=config.agents.model,
+        temperature=config.agents.temperature,
+        config=config,
+    )
+
+    async def fake_build_prompt_history(*args, **kwargs):
+        return []
+
+    async def fake_build_messages(**kwargs):
+        return [{"role": "user", "content": kwargs["current_message"]}]
+
+    async def fake_run_agent_loop(**kwargs):
+        return "summary", None, [], {}, 1
+
+    loop._build_prompt_history = fake_build_prompt_history
+
+    class FakeContextBuilder:
+        def __init__(self, *args, **kwargs):
+            captured["connection"] = kwargs.get("openviking_connection")
+
+        async def build_messages(self, **kwargs):
+            return await fake_build_messages(**kwargs)
+
+    monkeypatch.setattr("vikingbot.agent.context.ContextBuilder", FakeContextBuilder)
+    loop._run_agent_loop = fake_run_agent_loop
+
+    outbound = await loop._process_system_message(
+        InboundMessage(
+            sender_id="subagent",
+            session_key=session_key,
+            content="subagent done",
+            metadata=metadata,
+            openviking_connection=connection,
+        )
+    )
+
+    assert outbound.content == "summary"
+    assert outbound.metadata == metadata
+    assert outbound.metadata is not metadata
+    assert captured["connection"] is connection
 
 
 @pytest.mark.asyncio
@@ -115,3 +230,98 @@ async def test_feishu_send_skips_normal_message_without_reply_to():
             content="hello",
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_feishu_upload_image_uses_detected_jpeg_format(monkeypatch):
+    channel = FeishuChannel(FeishuChannelConfig(app_id="cli_app"), MessageBus())
+    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01fake-jpeg"
+    captured = {}
+
+    async def fake_token():
+        return "tenant-token"
+
+    class FakeResponse:
+        is_error = False
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"code": 0, "data": {"image_key": "img_key"}}
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, headers, data, files):
+            captured.update(url=url, headers=headers, data=data, files=files)
+            return FakeResponse()
+
+    monkeypatch.setattr(channel, "_get_tenant_access_token", fake_token)
+    monkeypatch.setattr("vikingbot.channels.feishu.httpx.AsyncClient", FakeClient)
+
+    image_key = await channel._upload_image_to_feishu(jpeg_bytes)
+
+    filename, file_obj, mime_type = captured["files"]["image"]
+    assert image_key == "img_key"
+    assert filename == "image.jpg"
+    assert mime_type == "image/jpeg"
+    assert file_obj.read() == jpeg_bytes
+
+
+@pytest.mark.asyncio
+async def test_feishu_upload_retries_with_normalized_image_after_bad_request(monkeypatch):
+    channel = FeishuChannel(FeishuChannelConfig(app_id="cli_app"), MessageBus())
+    original_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01original-with-metadata"
+    normalized_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01normalized"
+    uploads = []
+
+    async def fake_token():
+        return "tenant-token"
+
+    class FakeResponse:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self.text = body
+            self.is_error = status_code >= 400
+
+        def json(self):
+            return {"code": 0, "data": {"image_key": "img_key"}}
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, headers, data, files):
+            filename, file_obj, mime_type = files["image"]
+            uploads.append((filename, mime_type, file_obj.read()))
+            if len(uploads) == 1:
+                return FakeResponse(400, '{"code":234011,"msg":"can not recognize image"}')
+            return FakeResponse(200, '{"code":0}')
+
+    monkeypatch.setattr(channel, "_get_tenant_access_token", fake_token)
+    monkeypatch.setattr(channel, "_normalize_image_for_feishu", lambda data: normalized_bytes)
+    monkeypatch.setattr("vikingbot.channels.feishu.httpx.AsyncClient", FakeClient)
+
+    image_key = await channel._upload_image_to_feishu(original_bytes)
+
+    assert image_key == "img_key"
+    assert uploads == [
+        ("image.jpg", "image/jpeg", original_bytes),
+        ("image.jpg", "image/jpeg", normalized_bytes),
+    ]

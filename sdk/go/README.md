@@ -85,6 +85,18 @@ for _, item := range results.Resources {
 	fmt.Println(item.URI, item.Score)
 }
 
+// Search by image. Image accepts a local path, viking:// URI, HTTP URL, or data:image URI.
+imageResults, err := client.Find(ctx, "", &openviking.FindOptions{
+	TargetURI: "viking://resources/images",
+	Image:     "./query.png",
+	Limit:     5,
+})
+similarPosters, err := client.Search(ctx, "similar poster", &openviking.SearchOptions{
+	TargetURI: "viking://resources/images",
+	Image:     "viking://resources/images/poster.png",
+	Limit:     5,
+})
+
 // Work with sessions.
 session, err := client.CreateSession(ctx, &openviking.CreateSessionOptions{
 	SessionID: "demo-session",
@@ -96,7 +108,8 @@ commit, err := client.CommitSession(ctx, "demo-session", &openviking.CommitSessi
 	KeepRecentCount: 2,
 })
 
-_, _, _ = resource, updated, session
+_, _, _, _ = resource, updated, imageResults, similarPosters
+_ = session
 _ = commit
 ```
 
@@ -116,7 +129,7 @@ Implemented:
 | Sessions and tasks | `CreateSession`, `ListSessions`, `GetSession`, `SessionExists`, `GetSessionContext`, `GetSessionArchive`, `DeleteSession`, `AddMessage`, `BatchAddMessages`, `CommitSession`, `GetTask`, `ListTasks` |
 | Packs | `ExportOVPack`, `BackupOVPack`, `ImportOVPack`, `RestoreOVPack` |
 | System and observer | `Health`, `CheckConsistency`, `GetStatus`, `IsHealthy`, `QueueStatus`, `VikingDBStatus`, `ModelsStatus` |
-| Admin | `AdminCreateAccount`, `AdminCreateAccountWithOptions`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminRegisterUserWithOptions`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminMigrate` |
+| Admin | `AdminCreateAccount`, `AdminCreateAccountWithOptions`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminRegisterUserWithOptions`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminRegenerateKeyWithOptions`, `AdminMigrate` |
 
 Not implemented in Go SDK v1:
 
@@ -135,15 +148,27 @@ config. Ordinary add calls do not need SDK defaults; omit `To` / `TargetURI`
 and let the server resolve user and deployment defaults.
 
 ```go
+seed := "alice-seed"
 _, err := client.AdminRegisterUserWithOptions(ctx, "acme", "alice", "user", &openviking.AdminRegisterUserOptions{
-	UserConfig: map[string]any{
+    Seed: &seed,
+    UserConfig: map[string]any{
 		"add_targets": map[string]any{
 			"resource_uri": "viking://user/resources/project-a",
 			"skill_uri":    "viking://user/skills",
 		},
 	},
 })
+
+newSeed := "alice-new-seed"
+_, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "alice", &openviking.AdminRegenerateKeyOptions{
+    Seed: &newSeed,
+})
 ```
+
+When `Seed` is set, the returned API key is derived from
+`sha256(user_id + "\0" + seed)`; omit it for random key generation.
+Use `nil` to omit `Seed`; set `Seed` to a string pointer to send it, including
+an empty string that the server rejects.
 
 ## Files, Directories, and Packs
 

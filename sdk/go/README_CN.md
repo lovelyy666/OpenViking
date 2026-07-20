@@ -33,6 +33,34 @@ Go SDK 发送的身份请求头与 Python HTTP client 一致：
 
 Go SDK 仅支持 HTTP 模式，不支持 Python embedded 模式，也不保留旧 `agent_id` 兼容路径。
 
+## 图片检索示例
+
+`FindOptions.Image` 和 `SearchOptions.Image` 支持本地路径、`viking://`、`http(s)://` 或 `data:image` URI；本地图片会在 SDK 内转成 base64 data URI，HTTP 请求体仍发送服务端字段 `image_url`。
+
+```go
+// 本地图片以图搜图
+imageResults, err := client.Find(ctx, "", &openviking.FindOptions{
+    TargetURI: "viking://resources/images",
+    Image:     "./query.png",
+    Limit:     5,
+})
+
+// 已入库图片作为查询图
+storedImageResults, err := client.Find(ctx, "", &openviking.FindOptions{
+    TargetURI: "viking://resources/images",
+    Image:     "viking://resources/images/cat.png",
+    Limit:     5,
+})
+
+// 图文联合检索
+similarPosters, err := client.Search(ctx, "红色海报风格", &openviking.SearchOptions{
+    TargetURI: "viking://resources/images",
+    Image:     "./poster.png",
+    Limit:     5,
+})
+_, _, _ = imageResults, storedImageResults, similarPosters
+```
+
 ## 已实现接口
 
 | 模块 | Go 方法 |
@@ -45,7 +73,7 @@ Go SDK 仅支持 HTTP 模式，不支持 Python embedded 模式，也不保留�
 | 会话和任务 | `CreateSession`, `ListSessions`, `GetSession`, `SessionExists`, `GetSessionContext`, `GetSessionArchive`, `DeleteSession`, `AddMessage`, `BatchAddMessages`, `CommitSession`, `GetTask`, `ListTasks` |
 | OVPack | `ExportOVPack`, `BackupOVPack`, `ImportOVPack`, `RestoreOVPack` |
 | 系统和 observer | `Health`, `CheckConsistency`, `GetStatus`, `IsHealthy`, `QueueStatus`, `VikingDBStatus`, `ModelsStatus` |
-| 管理接口 | `AdminCreateAccount`, `AdminCreateAccountWithOptions`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminRegisterUserWithOptions`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminMigrate` |
+| 管理接口 | `AdminCreateAccount`, `AdminCreateAccountWithOptions`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminRegisterUserWithOptions`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminRegenerateKeyWithOptions`, `AdminMigrate` |
 
 ## 暂未实现接口
 
@@ -64,7 +92,9 @@ Go SDK v1 的边界是对齐当前 Python HTTP client，不覆盖所有 server �
 创建用户时如需写入初始服务端用户配置，使用 options 版本。普通 add 调用不需要 SDK 侧默认值；省略 `To` / `TargetURI`，让服务端解析用户和部署默认值。
 
 ```go
+seed := "alice-seed"
 _, err := client.AdminRegisterUserWithOptions(ctx, "acme", "alice", "user", &openviking.AdminRegisterUserOptions{
+    Seed: &seed,
     UserConfig: map[string]any{
         "add_targets": map[string]any{
             "resource_uri": "viking://user/resources/project-a",
@@ -72,7 +102,15 @@ _, err := client.AdminRegisterUserWithOptions(ctx, "acme", "alice", "user", &ope
         },
     },
 })
+
+newSeed := "alice-new-seed"
+_, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "alice", &openviking.AdminRegenerateKeyOptions{
+    Seed: &newSeed,
+})
 ```
+
+传入 `Seed` 时，返回的 API Key 会基于 `sha256(user_id + "\0" + seed)` 生成；省略时仍使用随机生成逻辑。
+使用 `nil` 表示不传 `Seed`；传入字符串指针表示显式发送 seed，包括会被服务端拒绝的空字符串。
 
 ## 技能和 Watch 示例
 

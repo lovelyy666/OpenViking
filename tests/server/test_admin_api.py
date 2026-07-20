@@ -4,6 +4,7 @@
 """Tests for Admin API endpoints (openviking/server/routers/admin.py)."""
 
 import asyncio
+import hashlib
 import json
 import uuid
 
@@ -35,7 +36,24 @@ def _uid() -> str:
     return f"acme_{uuid.uuid4().hex[:8]}"
 
 
+def _seed_secret(user_id: str, seed: str) -> str:
+    return hashlib.sha256(f"{user_id}\0{seed}".encode("utf-8")).hexdigest()
+
+
 ROOT_KEY = "admin-api-test-root-key-abcdef1234567890ab"
+
+
+class _NoopLockContext:
+    """The lightweight fake storage does not exercise transaction locking."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
 
 
 class _FakeAGFS:
@@ -129,7 +147,13 @@ def _build_lightweight_admin_test_app() -> FastAPI:
 
 
 @pytest_asyncio.fixture(scope="function")
-async def lightweight_admin_app():
+async def lightweight_admin_app(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.server.api_keys.legacy.get_lock_manager", lambda: None
+    )
+    monkeypatch.setattr(
+        "openviking.server.api_keys.legacy.LockContext", _NoopLockContext
+    )
     app = _build_lightweight_admin_test_app()
     await app.state.api_key_manager.load()
     return app
@@ -665,6 +689,60 @@ async def test_regenerate_key(admin_client: httpx.AsyncClient):
         headers={"X-API-Key": new_key},
     )
     assert resp.status_code == 200
+
+
+async def test_seeded_admin_key_endpoints(admin_client: httpx.AsyncClient):
+    from openviking.server.api_keys import parse_api_key
+
+    acct = _uid()
+    resp = await admin_client.post(
+        "/api/v1/admin/accounts",
+        json={"account_id": acct, "admin_user_id": "alice", "seed": "admin-seed"},
+        headers=root_headers(),
+    )
+    assert resp.status_code == 200
+    admin_key = resp.json()["result"]["user_key"]
+    account_id, user_id, secret = parse_api_key(admin_key)
+    assert account_id == acct
+    assert user_id == "alice"
+    assert secret == _seed_secret("alice", "admin-seed")
+
+    resp = await admin_client.post(
+        f"/api/v1/admin/accounts/{acct}/users",
+        json={"user_id": "bob", "role": "user", "seed": "bob-seed"},
+        headers=root_headers(),
+    )
+    assert resp.status_code == 200
+    old_key = resp.json()["result"]["user_key"]
+    _, _, old_secret = parse_api_key(old_key)
+    assert old_secret == _seed_secret("bob", "bob-seed")
+
+    resp = await admin_client.post(
+        f"/api/v1/admin/accounts/{acct}/users/bob/key",
+        json={"seed": "bob-new-seed"},
+        headers=root_headers(),
+    )
+    assert resp.status_code == 200
+    new_key = resp.json()["result"]["user_key"]
+    _, _, new_secret = parse_api_key(new_key)
+    assert new_secret == _seed_secret("bob", "bob-new-seed")
+    assert new_key != old_key
+
+    resp = await admin_client.get(
+        "/api/v1/fs/ls?uri=viking://",
+        headers={"X-API-Key": old_key},
+    )
+    assert resp.status_code == 401
+
+
+async def test_empty_seed_rejected(admin_client: httpx.AsyncClient):
+    acct = _uid()
+    resp = await admin_client.post(
+        "/api/v1/admin/accounts",
+        json={"account_id": acct, "admin_user_id": "alice", "seed": ""},
+        headers=root_headers(),
+    )
+    assert resp.status_code == 400
 
 
 # ---- Permission guard ----
@@ -1259,11 +1337,7 @@ async def test_trusted_mode_admin_can_list_users_without_account_or_user_headers
 
     resp = await trusted_admin_client.get(
         f"/api/v1/admin/accounts/{acct}/users",
-        headers={
-            "X-API-Key": ROOT_KEY,
-            "X-OpenViking-Account": acct,
-            "X-OpenViking-User": "alice",
-        },
+        headers={"X-API-Key": ROOT_KEY},
     )
     assert resp.status_code == 200
     assert any(user["user_id"] == "alice" for user in resp.json()["result"])
